@@ -146,6 +146,49 @@ def get_git_url(repo_url):
     return repo_url, {}
 
 
+def cleanup_old_tags(keep_days=7):
+    """
+    清理旧的 archive 标签，只保留最近 N 天的
+    
+    Args:
+        keep_days: 保留天数
+    """
+    try:
+        result = run_cmd("git tag -l 'archive-*'", timeout=10, silent_error=True)
+        if result.returncode != 0:
+            return
+        
+        tags = result.stdout.strip().split('\n')
+        if not tags or tags[0] == '':
+            return
+        
+        # 按日期排序，保留最近的
+        cutoff_date = datetime.now().strftime("%Y%m%d")
+        tags_to_delete = []
+        
+        for tag in tags:
+            # 提取日期部分：archive-YYYYMMDD_HHMMSS
+            try:
+                date_str = tag.split('-')[1].split('_')[0]
+                if date_str < cutoff_date[:8]:  # 保留今天的
+                    tags_to_delete.append(tag)
+            except (IndexError, ValueError):
+                continue
+        
+        # 只保留最近 7 天的标签
+        if len(tags_to_delete) > keep_days:
+            tags_to_delete = sorted(tags_to_delete)[:-keep_days]
+        
+        # 删除旧标签
+        if tags_to_delete:
+            logger.info(f"清理 {len(tags_to_delete)} 个旧标签")
+            for tag in tags_to_delete:
+                run_cmd(f"git tag -d {tag}", timeout=5, silent_error=True)
+                
+    except Exception as e:
+        logger.warning(f"清理标签失败: {e}")
+
+
 def backup_git(repo_url, repo_dir, safe_name):
     """
     备份 Git 仓库
@@ -185,6 +228,9 @@ def backup_git(repo_url, repo_dir, safe_name):
         # 创建归档标签
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         run_cmd(f"git tag archive-{ts}", timeout=10, silent_error=True)
+        
+        # 清理旧的 archive 标签（只保留最近 7 个）
+        cleanup_old_tags()
         
         # 推送到 Keybase
         if USERNAME:
