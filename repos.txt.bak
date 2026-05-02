@@ -1,0 +1,7 @@
+# Git 仓库备份列表
+# 每行一个仓库 URL，# 开头为注释
+# 支持 GitHub / Gitea / Forgejo 等平台
+https://github.com/bestruirui/octopus
+https://git.um-react.app/um/cli
+https://github.com/LifeArchiveProject/WeChatDataAnalysis
+https://github.com/hicccc77/WeFlow

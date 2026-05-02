@@ -1,0 +1,5 @@
+# Git2Keybase 备份脚本
+repos_cache/
+.env
+*.log
+
