@@ -4,3 +4,4 @@ repos_cache/
 *.log
 __pycache__/
 *.pyc
+repo_sizes.json

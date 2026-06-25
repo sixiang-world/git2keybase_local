@@ -7,7 +7,7 @@ cd "$SCRIPT_DIR"
 
 # 运行备份
 echo "开始备份..."
-RESULT=$(python3 collect_backup_v4.py 2>&1)
+RESULT=$(python3 collect_backup.py 2>&1)
 
 # 提取 JSON 部分
 JSON=$(echo "$RESULT" | grep -A 1000 "^{" | head -n -1)
