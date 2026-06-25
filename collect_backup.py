@@ -4,7 +4,7 @@ Git2Keybase 备份收集脚本 — 防删库版 (Local Hermes Cron)
 
 核心防删策略：
   仓库数据大小 = 安全锚点。
-  如果本地缓存大小与上次备份相比骤降（< 20%），说明上游被删库/清空了。
+  如果本轮 fetch 后本地缓存大小骤降（< 20% 旧大小），说明上游被删库/清空了。
   此时跳过推送，保留 Keybase 上已有的完整备份不变，并发送微信告警。
 
 备份方式：
@@ -26,11 +26,27 @@ Git2Keybase 备份收集脚本 — 防删库版 (Local Hermes Cron)
 import os
 import sys
 import json
-import subprocess
-import requests
+import shlex
 import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
+
+import requests
+
+# ── 共享库导入 ────────────────────────────────────────
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "git2keybase" / "scripts"))
+
+from git2keybase_lib import (
+    log,
+    run_cmd,
+    get_repo_size,
+    check_size_and_update_db,
+    _fmt_size,
+    make_repo_key,
+    make_safe_name,
+    send_wxpush_notification,
+    SIZE_DROP_RATIO,
+)
 
 # ── 配置 ──────────────────────────────────────────────
 SCRIPT_DIR = Path(__file__).parent
@@ -40,161 +56,28 @@ REPOS_FILE = Path(os.environ.get("REPOS_FILE", SCRIPT_DIR / "repos.txt"))
 WORKDIR = Path(os.environ.get("BACKUP_WORKDIR", SCRIPT_DIR / "repos_cache"))
 USERNAME = os.environ.get("KEYBASE_USERNAME", "")
 GH_TOKEN = os.environ.get("GITHUB_TOKEN", "")
-WXPUSH_TOKEN = os.environ.get("WXPUSH_API_TOKEN", "")
+WXPUSH_API_TOKEN = os.environ.get("WXPUSH_API_TOKEN", "")
 
 WORKDIR.mkdir(parents=True, exist_ok=True)
 
-# 大小阈值
-SIZE_DROP_RATIO = 0.20  # 相比上次备份缩小 < 20% 视为删库
 
+# ── 认证 URL ──────────────────────────────────────────
 
-def log(msg: str, level: str = "INFO"):
-    """日志输出到 stderr，不影响 stdout 的 JSON"""
-    print(f"[{level}] {msg}", file=sys.stderr)
-
-
-def run_cmd(cmd: str, timeout: int = 300, cwd: str = None, silent: bool = False) -> subprocess.CompletedProcess:
-    """运行命令，返回 CompletedProcess"""
-    try:
-        result = subprocess.run(
-            cmd, shell=True, capture_output=True, text=True, timeout=timeout, cwd=cwd,
-        )
-        if result.returncode != 0 and not silent:
-            if result.stderr.strip():
-                log(f"命令提示: {result.stderr.strip()[:200]}", "WARN")
-        return result
-    except subprocess.TimeoutExpired:
-        log(f"命令超时 ({timeout}s): {cmd}", "ERROR")
-        return subprocess.CompletedProcess(args=cmd, returncode=-1, stdout="", stderr="timeout")
-    except Exception as e:
-        log(f"命令异常: {cmd}, {e}", "ERROR")
-        return subprocess.CompletedProcess(args=cmd, returncode=-1, stdout="", stderr=str(e))
-
-
-# ── 微信通知 ──────────────────────────────────────────
-
-def send_wxpush_notification(repo_url: str, prev_size: int, current_size: int):
-    """检测到删库时发送微信告警通知"""
-    if not WXPUSH_TOKEN:
-        log("WXPUSH_API_TOKEN 未设置，跳过微信通知", "WARN")
-        return
-
-    title = "【git2keybase 删库告警】"
-    content = (
-        f"检测到仓库疑似被清空！\n"
-        f"仓库：{repo_url}\n"
-        f"上次大小：{_fmt_size(prev_size)}\n"
-        f"当前大小：{_fmt_size(current_size)}\n"
-        f"时间：{datetime.now(timezone.utc).isoformat()}"
-    )
-
-    try:
-        resp = requests.get(
-            "https://push.hzz.cool/wxsend",
-            params={"title": title, "content": content, "token": WXPUSH_TOKEN},
-            timeout=10,
-        )
-        log(f"微信通知发送完成 (HTTP {resp.status_code})", "INFO")
-    except requests.exceptions.RequestException as e:
-        log(f"微信通知发送失败: {e}", "WARN")
-
-
-# ── 大小跟踪 ──────────────────────────────────────────
-
-def load_sizes() -> dict:
-    if SIZE_DB.exists():
-        try:
-            return json.loads(SIZE_DB.read_text())
-        except (json.JSONDecodeError, OSError):
-            return {}
-    return {}
-
-
-def save_sizes(sizes: dict):
-    SIZE_DB.write_text(json.dumps(sizes, indent=2, ensure_ascii=False))
-
-
-def get_repo_size(repo_dir: str) -> int:
-    """返回仓库目录的总大小（字节）"""
-    result = run_cmd(f"du -sb {repo_dir} 2>/dev/null | cut -f1", timeout=10, silent=True)
-    if result.returncode == 0 and result.stdout.strip().isdigit():
-        return int(result.stdout.strip())
-    return 0
-
-
-def check_size_and_update_db(repo_key: str, size: int) -> tuple[bool, int, str]:
+def get_auth_git_url(repo_url: str) -> str:
     """
-    检查仓库大小是否可疑，并更新记录。
-
-    Returns:
-        (safe: bool, size: int, message: str)
-        safe=True  → 可以推送
-        safe=False → 疑似删库，跳过推送
-    """
-    sizes = load_sizes()
-    prev_size = sizes.get(repo_key, 0)
-
-    if prev_size > 0:
-        if size < prev_size * SIZE_DROP_RATIO:
-            drop_pct = (1 - size / prev_size) * 100
-            msg = f"仓库大小骤降 {drop_pct:.1f}% ({_fmt_size(prev_size)} → {_fmt_size(size)})，疑似删库，跳过推送"
-            log(msg, "ERROR")
-            send_wxpush_notification(repo_key, prev_size, size)
-            return False, size, msg
-        elif size < prev_size * 0.5:
-            log(f"仓库缩小 {_fmt_size(prev_size)} → {_fmt_size(size)}，但仍 > 20%，继续", "WARN")
-        else:
-            log(f"仓库大小正常: {_fmt_size(size)} (上次 {_fmt_size(prev_size)})")
-    else:
-        log(f"首次备份，大小: {_fmt_size(size)}")
-
-    # 更新记录
-    sizes[repo_key] = size
-    save_sizes(sizes)
-    return True, size, f"大小正常: {_fmt_size(size)}"
-
-
-def _fmt_size(b: int) -> str:
-    if b < 1024:
-        return f"{b}B"
-    elif b < 1024 * 1024:
-        return f"{b / 1024:.1f}KB"
-    else:
-        return f"{b / 1024 / 1024:.1f}MB"
-
-
-# ── 核心备份逻辑 ──────────────────────────────────────
-
-def get_auth_url_and_env(repo_url: str) -> tuple[str, dict]:
-    """
-    返回（带 token 认证的 git URL, 环境变量 dict）。
-    对 GitHub 仓库使用 x-access-token 认证，避免 token 暴露在命令行。
+    返回带 token 认证的 git URL。
+    对 GitHub 仓库使用 x-access-token 认证。
     """
     parsed = urllib.parse.urlparse(repo_url)
     is_github = parsed.netloc == "github.com"
     if is_github and GH_TOKEN:
-        auth_url = f"https://x-access-token:{GH_TOKEN}@{parsed.netloc}{parsed.path}"
-        return auth_url, {}
-    return repo_url, {}
+        return (
+            f"https://x-access-token:{GH_TOKEN}@{parsed.netloc}{parsed.path}"
+        )
+    return repo_url
 
 
-def make_repo_key(repo_url: str) -> str:
-    """从 URL 生成唯一仓库标识"""
-    parsed = urllib.parse.urlparse(repo_url)
-    path = parsed.path.lstrip("/")
-    if path.endswith(".git"):
-        path = path[:-4]
-    return f"{parsed.netloc}/{path}"
-
-
-def make_safe_name(repo_url: str) -> str:
-    """生成安全目录名"""
-    parsed = urllib.parse.urlparse(repo_url)
-    path = parsed.path.lstrip("/")
-    if path.endswith(".git"):
-        path = path[:-4]
-    return f"{parsed.netloc.replace('.', '_')}_{path.replace('/', '_')}"
-
+# ── 核心备份逻辑 ──────────────────────────────────────
 
 def backup_repo(repo_url: str) -> dict:
     """
@@ -205,7 +88,7 @@ def backup_repo(repo_url: str) -> dict:
     safe_name = make_safe_name(repo_url)
     repo_key = make_repo_key(repo_url)
     repo_dir = WORKDIR / f"{safe_name}.git"
-    auth_url, git_env = get_auth_url_and_env(repo_url)
+    auth_url = get_auth_git_url(repo_url)
 
     result = {
         "url": repo_url,
@@ -222,15 +105,29 @@ def backup_repo(repo_url: str) -> dict:
 
     # ── 1. 确保 Keybase remote 存在 ──
     if USERNAME:
-        run_cmd(f"keybase git create {safe_name} || true", timeout=10, silent=True)
+        run_cmd(
+            f"keybase git create {shlex.quote(safe_name)} || true",
+            timeout=10,
+            silent=True,
+        )
 
     is_new = not repo_dir.exists()
 
     try:
-        # ── 2. 克隆或增量 fetch ──
+        # ── 2a. 测量旧大小（fetch 前）— 用于 old vs new 比较 ──
+        if not is_new:
+            old_size = get_repo_size(str(repo_dir))
+        else:
+            old_size = 0
+
+        # ── 2b. 克隆或增量 fetch ──
         if is_new:
             log("首次克隆...")
-            r = run_cmd(f"git clone --bare {auth_url} {repo_dir}", timeout=600, cwd=str(WORKDIR))
+            r = run_cmd(
+                f"git clone --bare {shlex.quote(auth_url)} {shlex.quote(str(repo_dir))}",
+                timeout=600,
+                cwd=str(WORKDIR),
+            )
             if r.returncode != 0:
                 result["status"] = "failed"
                 result["errors"].append(f"克隆失败: {r.stderr.strip()[:200]}")
@@ -239,63 +136,116 @@ def backup_repo(repo_url: str) -> dict:
         else:
             log("增量 fetch（安全 refspec，不丢失本地 ref）...")
             r = run_cmd(
-                f"git fetch origin "
+                "git fetch origin "
                 "'+refs/heads/*:refs/heads/*' '+refs/tags/*:refs/tags/*' --force --tags",
                 timeout=600,
                 cwd=str(repo_dir),
             )
             if r.returncode != 0:
-                log(f"fetch 失败: {r.stderr.strip()[:200]}，推送当前缓存到 Keybase", "WARN")
-                result["warnings"].append(f"fetch 失败，推送当前缓存: {r.stderr.strip()[:100]}")
+                log(
+                    f"fetch 失败: {r.stderr.strip()[:200]}，推送当前缓存到 Keybase",
+                    "WARN",
+                )
+                result["warnings"].append(
+                    f"fetch 失败，推送当前缓存: {r.stderr.strip()[:100]}"
+                )
             action = "fetched"
 
-        # ── 3. 测量仓库大小 ──
+        # ── 3. 测量新大小（fetch 后） ──
         size = get_repo_size(str(repo_dir))
         result["size"] = size
         log(f"仓库大小: {_fmt_size(size)}")
 
-        # ── 4. 大小检查（防删库） ──
-        safe, _, _ = check_size_and_update_db(repo_key, size)
+        # ── 4. 大小为零 → 跳过（不更新 DB） ──
+        if size == 0:
+            log("仓库大小测量为 0，跳过推送", "WARN")
+            result["status"] = "failed"
+            result["errors"].append("仓库大小测量为 0，跳过推送")
+            return result
+
+        # ── 5. 防删库检查：old_size vs new_size ──
+        if old_size > 0 and size < old_size * SIZE_DROP_RATIO:
+            drop_pct = (1 - size / old_size) * 100
+            msg = (
+                f"仓库在本轮 fetch 后大小骤降 {drop_pct:.1f}% "
+                f"({_fmt_size(old_size)} → {_fmt_size(size)})，疑似上游删库"
+            )
+            log(msg, "ERROR")
+            send_wxpush_notification(repo_key, old_size, size, WXPUSH_API_TOKEN)
+            result["status"] = "preserved"
+            result["action"] = "deletion_detected_skipped"
+            result["warnings"].append(msg)
+            log("✅ Keybase 已有备份保持完好，未覆盖")
+            return result
+
+        # ── 6. DB 大小检查 + 20-50% 范围警告 ──
+        safe, check_msg, warnings = check_size_and_update_db(
+            repo_key, size, str(SIZE_DB), WXPUSH_API_TOKEN
+        )
+        result["warnings"].extend(warnings)
         if not safe:
             result["status"] = "preserved"
             result["action"] = "deletion_detected_skipped"
             log("✅ Keybase 已有备份保持完好，未覆盖")
             return result
 
-        # ── 5. 打时间戳锚点 tag ──
+        # ── 7. 打时间戳锚点 tag ──
         ts = datetime.now().strftime("%Y%m%d")
-        run_cmd(f"git tag archive-{ts} --force", timeout=10, silent=True, cwd=str(repo_dir))
+        run_cmd(
+            f"git tag archive-{ts} --force",
+            timeout=10,
+            silent=True,
+            cwd=str(repo_dir),
+        )
 
-        # ── 6. 推送到 Keybase（安全模式） ──
+        # ── 8. 推送到 Keybase（安全模式） ──
         if USERNAME:
             log("推送到 Keybase...")
             kb_remote = f"keybase://private/{USERNAME}/{safe_name}"
-            run_cmd("git remote remove keybase || true", timeout=5, silent=True, cwd=str(repo_dir))
-            run_cmd(f"git remote add keybase {kb_remote}", timeout=5, silent=True, cwd=str(repo_dir))
+            run_cmd(
+                "git remote remove keybase || true",
+                timeout=5,
+                silent=True,
+                cwd=str(repo_dir),
+            )
+            run_cmd(
+                f"git remote add keybase {shlex.quote(kb_remote)}",
+                timeout=5,
+                silent=True,
+                cwd=str(repo_dir),
+            )
 
-            # 先 push 所有分支
             r_branches = run_cmd(
                 "git push keybase --all --force",
-                timeout=600, silent=True, cwd=str(repo_dir),
+                timeout=600,
+                silent=True,
+                cwd=str(repo_dir),
             )
-            # 再 push 所有 tag
             r_tags = run_cmd(
                 "git push keybase --tags --force",
-                timeout=600, silent=True, cwd=str(repo_dir),
+                timeout=600,
+                silent=True,
+                cwd=str(repo_dir),
             )
 
             if r_branches.returncode != 0 and r_tags.returncode != 0:
                 log("普通推送失败，尝试保底推送 archive tag...", "WARN")
                 r_fallback = run_cmd(
                     f"git push keybase refs/tags/archive-{ts}:refs/tags/archive-{ts} --force",
-                    timeout=300, silent=True, cwd=str(repo_dir),
+                    timeout=300,
+                    silent=True,
+                    cwd=str(repo_dir),
                 )
                 if r_fallback.returncode != 0:
                     result["status"] = "partial"
-                    result["errors"].append(f"Keybase 推送失败: {r_fallback.stderr.strip()[:100]}")
+                    result["errors"].append(
+                        f"Keybase 推送失败: {r_fallback.stderr.strip()[:100]}"
+                    )
                 else:
                     result["status"] = "partial"
-                    result["warnings"].append("分支/Tag 推送失败，archive tag 已推送")
+                    result["warnings"].append(
+                        "分支/Tag 推送失败，archive tag 已推送"
+                    )
             else:
                 log("✅ Keybase 推送完成")
         else:
@@ -321,7 +271,11 @@ def main():
         summary = {
             "timestamp": datetime.now().isoformat(),
             "error": f"仓库列表文件不存在: {REPOS_FILE}",
-            "total": 0, "success": 0, "preserved": 0, "failed": 0, "repos": [],
+            "total": 0,
+            "success": 0,
+            "preserved": 0,
+            "failed": 0,
+            "repos": [],
         }
         print(json.dumps(summary, ensure_ascii=False, indent=2))
         sys.exit(1)
@@ -337,7 +291,11 @@ def main():
         summary = {
             "timestamp": datetime.now().isoformat(),
             "error": "仓库列表为空",
-            "total": 0, "success": 0, "preserved": 0, "failed": 0, "repos": [],
+            "total": 0,
+            "success": 0,
+            "preserved": 0,
+            "failed": 0,
+            "repos": [],
         }
         print(json.dumps(summary, ensure_ascii=False, indent=2))
         sys.exit(0)
@@ -364,8 +322,13 @@ def main():
         elif result["status"] == "failed":
             summary["failed"] += 1
 
-    log(f"\n{'=' * 50}")
-    log(f"汇总: 成功 {summary['success']}, 保留 {summary['preserved']}, 失败 {summary['failed']}, 共 {summary['total']}")
+    log(
+        f"\n{'=' * 50}"
+        f"\n汇总: 成功 {summary['success']}, "
+        f"保留 {summary['preserved']}, "
+        f"失败 {summary['failed']}, "
+        f"共 {summary['total']}"
+    )
 
     # 输出 JSON 到 stdout（与 run_backup.sh 兼容）
     print(json.dumps(summary, ensure_ascii=False, indent=2))
